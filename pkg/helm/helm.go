@@ -28,6 +28,7 @@ import (
 	"k8s.io/helm/pkg/proto/hapi/chart"
 	"k8s.io/helm/pkg/renderutil"
 	"k8s.io/helm/pkg/repo"
+	"k8s.io/helm/pkg/resolver"
 )
 
 const (
@@ -84,6 +85,7 @@ type LoadChartConfig struct {
 	CertFile string `yaml:"certFile,omitempty"`
 	KeyFile  string `yaml:"keyFile,omitempty"`
 	CaFile   string `yaml:"caFile,omitempty"`
+	LockFile string `yaml:"lockFile,omitempty"`
 }
 
 // RenderConfig defines the configuration to render a chart
@@ -287,6 +289,39 @@ func initStableRepo(cacheFile string, home helmpath.Home, settings environment.E
 	return &c, nil
 }
 
+// Check that the chart we want to render hasn't been tampered with by comparing the digest
+// of a lock file generated from a requirements.yaml that defines the target chart as a
+// dependency
+func verifyLock(ref *LoadChartConfig) (matchSum bool, err error) {
+
+	// Mock chart dependency containing the chart we want to render. We use this in
+	// order to use the provided hash method and compare dependencies
+	chartReq := chartutil.Dependency{
+		Name:       ref.Chart,
+		Repository: ref.Repository,
+		Version:    ref.Version,
+	}
+	dep := chartutil.Requirements{Dependencies: []*chartutil.Dependency{&chartReq}}
+
+	var lockData []byte
+	lockData, err = ioutil.ReadFile(ref.LockFile)
+	if err != nil {
+		return
+	}
+
+	lock := &chartutil.RequirementsLock{}
+	err = yaml.Unmarshal(lockData, lock)
+	if err != nil {
+		return
+	}
+
+	if sum, err := resolver.HashReq(&dep); err != nil || sum != lock.Digest {
+		return false, fmt.Errorf("requirements.lock is out of sync with requirements.yaml")
+	}
+
+	return true, err
+}
+
 // LoadChart download a chart or load it from cache
 func (h *Helm) LoadChart(ref *LoadChartConfig) (c *chart.Chart, err error) {
 	if err = h.Initialize(); err != nil {
@@ -312,6 +347,15 @@ func (h *Helm) LoadChart(ref *LoadChartConfig) (c *chart.Chart, err error) {
 	// Check chart requirements to make sure all dependencies are present in /charts
 	if c, err = chartutil.Load(chartPath); err != nil {
 		return
+	}
+
+	// If a lockfile is provided, check that our target chart hasn't changed
+	if ref.LockFile != "" {
+		var matchSum bool
+		if matchSum, err = verifyLock(ref); !matchSum || err != nil {
+			return
+		}
+		log.Printf("Checksum from provided requirements.lock matches the sum for chart to load.")
 	}
 
 	req, e := chartutil.LoadRequirements(c)
